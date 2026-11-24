@@ -1125,3 +1125,135 @@ def test_get_search_path_failure_raises(mocker: MockerFixture) -> None:
     with pytest.raises(Exception, match="permission denied"):
         spec.get_search_path(database, None, ["sales"])
     database.get_inspector.assert_not_called()
+
+
+def _opaque_numeric(values: list[str | None]) -> Any:
+    import pyarrow as pa
+
+    return pa.chunked_array(
+        [
+            pa.ExtensionArray.from_storage(
+                pa.opaque(pa.string(), "numeric", "PostgreSQL"),
+                pa.array(values, pa.string()),
+            )
+        ]
+    )
+
+
+def test_arrow_interval_matches_the_row_mutator() -> None:
+    import pyarrow as pa
+
+    from superset.db_engine_specs.postgres import _normalize_interval
+
+    interval = pa.MonthDayNano([14, 3, 14_706_000_000_000])
+    field = pa.field("v", pa.month_day_nano_interval())
+    column = pa.chunked_array([pa.array([interval, None], field.type)])
+    result = spec.normalize_arrow_column(field, column)
+    expected = _normalize_interval(
+        timedelta(days=365 + 2 * 30 + 3, hours=4, minutes=5, seconds=6)
+    )
+    assert result.to_pylist() == [expected, None]
+
+
+@pytest.mark.parametrize("unit", ["s", "ms", "us", "ns"])
+def test_arrow_duration_matches_the_row_mutator(unit: str) -> None:
+    import pyarrow as pa
+
+    from superset.db_engine_specs.postgres import _normalize_interval
+
+    field = pa.field("v", pa.duration(unit))
+    column = pa.chunked_array([pa.array([timedelta(minutes=-90), None], field.type)])
+    result = spec.normalize_arrow_column(field, column)
+    assert result.to_pylist() == [_normalize_interval(timedelta(minutes=-90)), None]
+
+
+def test_arrow_opaque_numeric_becomes_decimal() -> None:
+    from decimal import Decimal
+
+    import pyarrow as pa
+
+    column = _opaque_numeric(["1.50", "-2.25", "NaN", "Infinity", None])
+    field = pa.field("v", column.type)
+    result = spec.normalize_arrow_column(field, column)
+    assert result.type == pa.decimal128(38, 2)
+    assert result.to_pylist() == [Decimal("1.50"), Decimal("-2.25"), None, None, None]
+
+
+def test_arrow_opaque_numeric_too_wide_for_decimal128() -> None:
+    import pyarrow as pa
+
+    value = "1" * 60 + ".5"
+    column = _opaque_numeric([value])
+    result = spec.normalize_arrow_column(pa.field("v", column.type), column)
+    assert result.type == pa.decimal256(76, 1)
+
+
+def test_arrow_opaque_numeric_that_fits_no_decimal_keeps_text() -> None:
+    import pyarrow as pa
+
+    value = "-" + "1" * 80
+    column = _opaque_numeric([value, "NaN"])
+    result = spec.normalize_arrow_column(pa.field("v", column.type), column)
+    assert result.to_pylist() == [value, None]
+
+
+def test_arrow_opaque_numeric_all_non_finite() -> None:
+    import pyarrow as pa
+
+    column = _opaque_numeric(["NaN", None])
+    result = spec.normalize_arrow_column(pa.field("v", column.type), column)
+    assert result.to_pylist() == [None, None]
+
+
+def test_arrow_other_columns_are_left_alone() -> None:
+    import pyarrow as pa
+
+    field = pa.field("v", pa.int64())
+    assert spec.normalize_arrow_column(field, pa.chunked_array([[1]])) is None
+
+
+@pytest.mark.parametrize(
+    "typname,oid",
+    [("int4", 23), ("numeric", 1700), ("jsonb", 3802), ("_text", 1009)],
+)
+def test_arrow_type_names_match_psycopg2(typname: str, oid: int) -> None:
+    import pyarrow as pa
+
+    field = pa.field("v", pa.int32(), metadata={b"POSTGRESQL:type": typname})
+    assert spec.get_datatype_from_arrow_field(field) == spec.get_datatype(oid)
+
+
+def test_arrow_type_name_without_metadata_or_unknown() -> None:
+    import pyarrow as pa
+
+    assert spec.get_datatype_from_arrow_field(pa.field("v", pa.int32())) is None
+    field = pa.field("v", pa.int32(), metadata={b"POSTGRESQL:type": b"tsvector"})
+    assert spec.get_datatype_from_arrow_field(field) is None
+
+
+def test_psycopg2_cursor_keeps_the_row_path() -> None:
+    cursor = MagicMock(spec=["description", "fetchall", "fetchmany"])
+    assert spec.supports_arrow_result is True
+    assert spec.fetch_arrow(cursor) is None
+
+
+def test_arrow_negative_interval_truncates_like_timedelta() -> None:
+    import pyarrow as pa
+
+    from superset.db_engine_specs.postgres import _normalize_interval
+
+    interval = pa.MonthDayNano([0, 0, -5_400_000_000_500])
+    field = pa.field("v", pa.month_day_nano_interval())
+    column = pa.chunked_array([pa.array([interval], field.type)])
+    result = spec.normalize_arrow_column(field, column)
+    assert result.to_pylist() == [
+        _normalize_interval(timedelta(seconds=-5400, microseconds=0))
+    ]
+
+
+def test_arrow_type_name_without_psycopg2(mocker: MockerFixture) -> None:
+    import pyarrow as pa
+
+    mocker.patch.object(spec, "get_datatype", side_effect=ImportError)
+    field = pa.field("v", pa.int32(), metadata={b"POSTGRESQL:type": b"int4"})
+    assert spec.get_datatype_from_arrow_field(field) == "INT4"

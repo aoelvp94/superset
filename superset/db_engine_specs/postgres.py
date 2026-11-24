@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Collection
-from datetime import datetime
+from datetime import datetime, timedelta
 from re import Pattern
 from typing import Any, Callable, Optional, TYPE_CHECKING
 
@@ -172,6 +172,105 @@ def _normalize_interval(v: Any) -> Optional[float]:
         type(v).__name__,
     )
     return None
+
+
+def _timedelta_microseconds(count: int) -> int:
+    """Integer microseconds, truncating toward zero (timedelta's resolution)."""
+    if count >= 0:
+        return count // 1000
+    return -((-count) // 1000)
+
+
+def _month_day_nano_to_timedelta(value: Any) -> timedelta:
+    """
+    Turn an Arrow ``month_day_nano_interval`` into the timedelta psycopg2 builds.
+
+    PostgreSQL stores years inside the month count (12 months = 1 year).
+    psycopg2's text parser then uses 365 days per year and 30 days per month
+    (``typecast_datetime.c``). Splitting the month count the same way makes
+    ``_normalize_interval`` see the timedelta ``fetch_data`` would have mutated.
+    """
+    months = int(value.months)
+    sign = -1 if months < 0 else 1
+    years, leftover_months = divmod(abs(months), 12)
+    extra_days = sign * (years * 365 + leftover_months * 30)
+    return timedelta(
+        days=int(value.days) + extra_days,
+        microseconds=_timedelta_microseconds(int(value.nanoseconds)),
+    )
+
+
+def _arrow_field_is_postgres_interval(field: Any) -> bool:
+    """
+    Physical types ``fetch_data`` would have turned into a timedelta.
+
+    ``month_day_nano_interval`` is what the ADBC PostgreSQL driver returns.
+    ``duration`` is the same interval when a cursor has already dropped months.
+    A vendor type name of ``interval`` on some other storage (for example
+    text) is left alone: there is no timedelta to mutate.
+    """
+    import pyarrow as pa
+
+    arrow_type = field.type
+    return arrow_type == pa.month_day_nano_interval() or pa.types.is_duration(
+        arrow_type
+    )
+
+
+def _arrow_interval_column_to_milliseconds(field: Any, column: Any) -> Any:
+    """Apply ``_normalize_interval`` to every value. NULL stays NULL."""
+    import pyarrow as pa
+
+    if pa.types.is_duration(field.type):
+        values = [_normalize_interval(value) for value in column.to_pylist()]
+    else:
+        values = [
+            _normalize_interval(
+                None if value is None else _month_day_nano_to_timedelta(value)
+            )
+            for value in column.to_pylist()
+        ]
+    return pa.array(values, type=pa.float64())
+
+
+def _arrow_field_is_postgres_numeric(field: Any) -> bool:
+    """ADBC returns NUMERIC as an ``arrow.opaque`` column with string storage."""
+    arrow_type = field.type
+    return (
+        getattr(arrow_type, "extension_name", None) == "arrow.opaque"
+        and getattr(arrow_type, "type_name", None) == "numeric"
+    )
+
+
+def _arrow_numeric_column_to_decimal(column: Any) -> Any:
+    """
+    Cast opaque NUMERIC text to a decimal, as psycopg2 returns ``Decimal``.
+
+    NaN and Infinity become NULL, as the row constructor does for a non-finite
+    ``Decimal``. ``decimal128(38, s)`` is tried first, then ``decimal256(76, s)``;
+    values that fit neither keep their exact text.
+    """
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    storage = pa.chunked_array(
+        [chunk.storage for chunk in column.chunks], type=column.type.storage_type
+    )
+    finite = pc.match_substring_regex(storage, pattern=r"^[+-]?[0-9]*\.?[0-9]+$")
+    storage = pc.if_else(finite, storage, pa.scalar(None, pa.string()))
+    if storage.null_count == len(storage):
+        return storage
+    fraction = pc.replace_substring_regex(storage, pattern=r"^[^.]*\.?", replacement="")
+    integer = pc.replace_substring_regex(
+        storage, pattern=r"^[+-]?0*([0-9]*).*$", replacement=r"\1"
+    )
+    scale = pc.max(pc.utf8_length(fraction)).as_py() or 0
+    digits = (pc.max(pc.utf8_length(integer)).as_py() or 0) + scale
+    # Arrow's string-to-decimal cast does not reject values that overflow.
+    for decimal_type, precision in ((pa.decimal128, 38), (pa.decimal256, 76)):
+        if digits <= precision:
+            return pc.cast(storage, decimal_type(precision, scale))
+    return storage
 
 
 def _quote_identifier(name: str) -> str:
@@ -453,6 +552,9 @@ POSTGRES_TEMPORAL_LITERAL_FORMATS = (
 
 class PostgresEngineSpec(BasicParametersMixin, PostgresBaseEngineSpec):
     engine = "postgresql"
+    # psycopg2 has no Arrow fetch and keeps the row path; Arrow cursors such as
+    # ADBC PostgreSQL use it when ``ARROW_NATIVE_RESULT_SET`` is on.
+    supports_arrow_result = True
     engine_name = "PostgreSQL"
     engine_aliases = {"postgres"}
 
@@ -1175,6 +1277,73 @@ WHERE datistemplate = false;
             engine_params["connect_args"] = connect_args
             extra["engine_params"] = engine_params
         return extra
+
+    # Built-in type OIDs (stable across PostgreSQL versions) for the type
+    # names adbc-driver-postgresql puts in ``POSTGRESQL:type`` field metadata,
+    # so an Arrow result reports the same type strings as the psycopg2 row
+    # path (``get_datatype(cursor.description[i].type_code)``).
+    _ADBC_TYPNAME_OIDS = {
+        "bool": 16,
+        "bytea": 17,
+        "char": 18,
+        "name": 19,
+        "int8": 20,
+        "int2": 21,
+        "int4": 23,
+        "text": 25,
+        "oid": 26,
+        "json": 114,
+        "float4": 700,
+        "float8": 701,
+        "bpchar": 1042,
+        "varchar": 1043,
+        "date": 1082,
+        "time": 1083,
+        "timestamp": 1114,
+        "timestamptz": 1184,
+        "interval": 1186,
+        "timetz": 1266,
+        "numeric": 1700,
+        "uuid": 2950,
+        "jsonb": 3802,
+        "_bool": 1000,
+        "_int2": 1005,
+        "_int4": 1007,
+        "_text": 1009,
+        "_varchar": 1015,
+        "_int8": 1016,
+        "_float4": 1021,
+        "_float8": 1022,
+        "_numeric": 1231,
+    }
+
+    @classmethod
+    def normalize_arrow_column(cls, field: Any, column: Any) -> Any:
+        """
+        Match what psycopg2 and ``fetch_data`` produce: INTERVAL becomes float64
+        milliseconds and opaque NUMERIC becomes a decimal.
+        """
+        if _arrow_field_is_postgres_interval(field):
+            return _arrow_interval_column_to_milliseconds(field, column)
+        if _arrow_field_is_postgres_numeric(field):
+            return _arrow_numeric_column_to_decimal(column)
+        return None
+
+    @classmethod
+    def get_datatype_from_arrow_field(cls, field: Any) -> str | None:
+        metadata = getattr(field, "metadata", None) or {}
+        typname = metadata.get(b"POSTGRESQL:type")
+        if typname is None:
+            return None
+        if isinstance(typname, bytes):
+            typname = typname.decode("utf-8")
+        oid = cls._ADBC_TYPNAME_OIDS.get(typname)
+        if oid is None:
+            return None
+        try:
+            return cls.get_datatype(oid)
+        except ImportError:  # ADBC-only install, no psycopg2
+            return typname.upper()
 
     @classmethod
     def get_datatype(cls, type_code: Any) -> str | None:
