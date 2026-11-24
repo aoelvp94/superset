@@ -423,25 +423,47 @@ class SupersetResultSet:
         replaced = self.db_engine_spec.normalize_arrow_column(field, column)
         if replaced is not None:
             return replaced
+        if getattr(field.type, "extension_name", None) == "arrow.json":
+            return self._json_column(name, column)
         if isinstance(field.type, pa.BaseExtensionType):
             return column
         if pa.types.is_nested(field.type):
             values = column.to_pylist()
             self._nested_columns[name] = values
-            return pa.chunked_array(
-                [
-                    pa.array(
-                        [
-                            None if value is None else stringify(value)
-                            for value in values
-                        ],
-                        type=pa.string(),
-                    )
-                ]
-            )
+            return self._stringified(values)
         if pa.types.is_unsigned_integer(field.type) and field.type.bit_width == 64:
             return _uint64_over_int64_to_string(column)
         return column
+
+    def _json_column(self, name: str, column: pa.ChunkedArray) -> pa.ChunkedArray:
+        """
+        Parse ``arrow.json`` text the way a row driver hands back JSON: objects
+        and arrays are nested values, scalars keep their type.
+        """
+        values = [
+            None if value is None else json.loads(value)
+            for chunk in column.chunks
+            for value in chunk.storage.to_pylist()
+        ]
+        if any(isinstance(value, (list, dict)) for value in values):
+            self._nested_columns[name] = values
+            return self._stringified(values)
+        try:
+            return pa.chunked_array([pa.array(values)])
+        except (pa.ArrowInvalid, pa.ArrowTypeError, OverflowError):
+            return self._stringified(values)
+
+    @staticmethod
+    def _stringified(values: list[Any]) -> pa.ChunkedArray:
+        """JSON-stringify values as the row constructor does for nested cells."""
+        return pa.chunked_array(
+            [
+                pa.array(
+                    [None if value is None else stringify(value) for value in values],
+                    type=pa.string(),
+                )
+            ]
+        )
 
     @staticmethod
     def convert_pa_dtype(pa_dtype: pa.DataType) -> Optional[str]:

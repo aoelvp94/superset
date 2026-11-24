@@ -448,3 +448,39 @@ def test_fetch_arrow_result_reports_truncation(mocker: MockerFixture) -> None:
     assert table.num_rows == 2
 
     assert fetch_arrow_result(BaseEngineSpec, _TableCursor([1]), None) == (None, False)
+
+
+def _json_column(values: list[str | None]) -> pa.ExtensionArray:
+    return pa.ExtensionArray.from_storage(pa.json_(), pa.array(values, pa.string()))
+
+
+def test_json_objects_match_row_nested_values() -> None:
+    parsed = [{"a": 1}, {"b": [1, 2]}, None]
+    row_rs = SupersetResultSet(
+        [(value,) for value in parsed],
+        cast(DbapiDescription, [("c", "json")]),
+        BaseEngineSpec,
+    )
+    arrow_rs = SupersetResultSet.from_arrow(
+        pa.table({"c": _json_column(['{"a": 1}', '{"b": [1, 2]}', None])}),
+        BaseEngineSpec,
+    )
+    assert arrow_rs.pa_table.column("c").to_pylist() == (
+        row_rs.pa_table.column("c").to_pylist()
+    )
+    assert arrow_rs.to_pandas_df()["c"].tolist() == row_rs.to_pandas_df()["c"].tolist()
+
+
+def test_json_scalars_keep_their_type() -> None:
+    arrow_rs = SupersetResultSet.from_arrow(
+        pa.table({"c": _json_column(["3", "null", None])}), BaseEngineSpec
+    )
+    assert arrow_rs.pa_table.column("c").type == pa.int64()
+    assert arrow_rs.pa_table.column("c").to_pylist() == [3, None, None]
+
+
+def test_json_mixed_scalars_are_stringified() -> None:
+    arrow_rs = SupersetResultSet.from_arrow(
+        pa.table({"c": _json_column(["3", '"x"'])}), BaseEngineSpec
+    )
+    assert arrow_rs.pa_table.column("c").to_pylist() == ["3", '"x"']
